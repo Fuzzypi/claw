@@ -1,17 +1,20 @@
 {
   "name": "claw",
-  "version": "0.0.1",
-  "description": "AOS-governed project: claw",
-  "type": "module",
+  "version": "1.0.0",
+  "description": "Claw — AI agent orchestration engine",
+  "private": true,
   "scripts": {
     "verify:repo": "node verify/repo.verify.cjs",
     "verify:blueprint": "node verify/blueprint.verify.cjs",
-    "verify:all": "npm run verify:repo && npm run verify:blueprint"
+    "verify:phase01": "node verify/claw_phase01_store.verify.cjs",
+    "verify:phase02": "node verify/claw_phase02_dispatch.verify.cjs",
+    "verify:phase03": "node verify/claw_phase03_manual.verify.cjs",
+    "verify:phase04": "node verify/claw_phase04_context.verify.cjs",
+    "verify:phase05": "node verify/claw_phase05_aos.verify.cjs",
+    "verify:phase06": "node verify/claw_phase06_polish.verify.cjs",
+    "verify:all": "npm run verify:repo && npm run verify:blueprint && npm run verify:phase01 && npm run verify:phase02 && npm run verify:phase03 && npm run verify:phase04 && npm run verify:phase05 && npm run verify:phase06"
   },
   "engines": {
     "node": ">=20"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3"
   }
 }

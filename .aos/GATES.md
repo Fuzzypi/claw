@@ -1,20 +1,22 @@
-# AOS Verify Gate Registry
+# Verify Gate Registry — Claw
 
-## Foundation Gates (always active)
+## Foundation Gates
 
-| Gate | Script | Phase | Checks |
-|------|--------|-------|--------|
-| repo-structure | `verify/repo.verify.cjs` | 0 | Required governance files and directories exist |
-| blueprint | `verify/blueprint.verify.cjs` | 0 | Architecture blueprint is present, non-empty, has heading |
+| Gate | Script | Phase |
+|------|--------|-------|
+| repo-structure | `verify/repo.verify.cjs` | 0 |
+| blueprint | `verify/blueprint.verify.cjs` | 0 |
 
 ## Project Gates
 
-Project-specific gates are added here as phases are defined.
-Each gate must have:
-
-- A script in `verify/`
-- A phase assignment
-- Deterministic pass/fail criteria
+| Gate | Script | Phase |
+|------|--------|-------|
+| store | `verify/claw_phase01_store.verify.cjs` | 1 |
+| dispatch | `verify/claw_phase02_dispatch.verify.cjs` | 2 |
+| manual | `verify/claw_phase03_manual.verify.cjs` | 3 |
+| context | `verify/claw_phase04_context.verify.cjs` | 4 |
+| aos | `verify/claw_phase05_aos.verify.cjs` | 5 |
+| polish | `verify/claw_phase06_polish.verify.cjs` | 6 |
 
 ## Running Gates
 
