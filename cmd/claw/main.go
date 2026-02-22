@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/fuzzypi/claw/internal/cli"
+	"github.com/fuzzypi/claw/internal/engram"
 	"github.com/fuzzypi/claw/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -32,6 +34,19 @@ func main() {
 	}
 	defer s.Close()
 
+	// Engram memory integration (graceful degradation)
+	var engramClient *engram.Client
+	if os.Getenv("ENGRAM_ENABLED") != "false" {
+		engramURL := os.Getenv("ENGRAM_URL")
+		if engramURL == "" {
+			engramURL = "http://127.0.0.1:37777"
+		}
+		engramClient = engram.NewClient(engram.Config{URL: engramURL})
+		if engramClient != nil && engramClient.Available() {
+			log.Printf("[claw] Engram connected at %s", engramURL)
+		}
+	}
+
 	pipelineCmd := &cobra.Command{Use: "pipeline", Short: "Manage pipelines"}
 	pipelineCmd.AddCommand(cli.PipelineCreateCmd(s))
 
@@ -43,7 +58,7 @@ func main() {
 	agentCmd.AddCommand(cli.AgentListCmd(s))
 
 	rootCmd.AddCommand(versionCmd)
-	rootCmd.AddCommand(cli.RunCmd(s))
+	rootCmd.AddCommand(cli.RunCmd(s, engramClient))
 	rootCmd.AddCommand(cli.StatusCmd(s))
 	rootCmd.AddCommand(pipelineCmd)
 	rootCmd.AddCommand(jobCmd)

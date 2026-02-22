@@ -4,27 +4,37 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 
 	clawctx "github.com/fuzzypi/claw/internal/context"
+	"github.com/fuzzypi/claw/internal/engram"
 	"github.com/fuzzypi/claw/internal/gates"
 	"github.com/fuzzypi/claw/internal/store"
 )
 
 // Dispatcher assigns ready jobs to idle agents and manages execution.
 type Dispatcher struct {
-	store    *store.Store
-	interval time.Duration
-	mu       sync.Mutex
+	store     *store.Store
+	interval  time.Duration
+	mu        sync.Mutex
+	engram    *engram.Client
+	sessionID string
 }
 
 // NewDispatcher creates a new dispatcher with a 1-second poll interval.
-func NewDispatcher(s *store.Store) *Dispatcher {
+// An optional engram.Client enables memory persistence across runs.
+func NewDispatcher(s *store.Store, ec ...*engram.Client) *Dispatcher {
+	var engramClient *engram.Client
+	if len(ec) > 0 {
+		engramClient = ec[0]
+	}
 	return &Dispatcher{
 		store:    s,
 		interval: 1 * time.Second,
+		engram:   engramClient,
 	}
 }
 
@@ -41,6 +51,21 @@ func (d *Dispatcher) Run(pipelineID int64) error {
 	errCh := make(chan error, 1)
 
 	d.logActivity(&pipelineID, nil, nil, "pipeline_started", "Pipeline execution started")
+
+	// Start Engram session if available
+	if d.engram != nil && d.engram.Available() {
+		pipeline, pErr := d.store.GetPipeline(pipelineID)
+		if pErr == nil {
+			project := filepath.Base(pipeline.ProjectDir)
+			d.sessionID = d.engram.SessionStart(project)
+		}
+	}
+	defer func() {
+		if d.sessionID != "" {
+			d.engram.SessionEnd(d.sessionID, "")
+			d.sessionID = ""
+		}
+	}()
 
 	for {
 		// Recover stale jobs first
@@ -140,7 +165,7 @@ func (d *Dispatcher) executeJob(job *store.Job, agent *store.Agent) error {
 	var execErr error
 	switch agent.Type {
 	case "shell":
-		execErr = ExecuteShell(d.store, job, agent)
+		execErr = executeShellWithEngram(d.store, job, agent, d.engram)
 	case "manual":
 		execErr = ExecuteManual(d.store, job, agent, os.Stdin, os.Stdout)
 	default:
@@ -259,6 +284,55 @@ func (d *Dispatcher) extractAndStoreContext(job *store.Job) {
 
 	ctxStr := clawctx.ExtractContext(job.Name, output, exitCode, gateStatus)
 	_, _ = d.store.AddContextEntry(job.PipelineID, job.ID, ctxStr)
+
+	d.saveToEngram(job)
+}
+
+func (d *Dispatcher) saveToEngram(job *store.Job) {
+	if d.engram == nil || !d.engram.Available() {
+		return
+	}
+
+	pipeline, err := d.store.GetPipeline(job.PipelineID)
+	if err != nil {
+		return
+	}
+	project := filepath.Base(pipeline.ProjectDir)
+
+	status := "completed"
+	if job.ExitCode != nil && *job.ExitCode != 0 {
+		status = "failed"
+	}
+
+	content := ""
+	if job.Output != nil {
+		content = *job.Output
+		if len(content) > 500 {
+			content = content[:500] + "..."
+		}
+	}
+
+	topicKey := fmt.Sprintf("pipeline_%d_job_%d", job.PipelineID, job.ID)
+	d.engram.Save(
+		fmt.Sprintf("Job: %s [%s]", job.Name, status),
+		"discovery", content, topicKey, "project", project, d.sessionID,
+	)
+
+	// Save gate result if present
+	if job.GateStatus != nil {
+		gateContent := ""
+		if job.GateOutput != nil {
+			gateContent = *job.GateOutput
+			if len(gateContent) > 500 {
+				gateContent = gateContent[:500] + "..."
+			}
+		}
+		gateTopicKey := fmt.Sprintf("gate_%s", job.Name)
+		d.engram.Save(
+			fmt.Sprintf("Gate: %s [%s]", job.Name, *job.GateStatus),
+			"decision", gateContent, gateTopicKey, "project", project, d.sessionID,
+		)
+	}
 }
 
 // RecoverStaleJobs resets timed-out jobs and frees their agents.

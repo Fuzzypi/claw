@@ -1,12 +1,17 @@
 package dispatch
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/fuzzypi/claw/internal/engram"
 	"github.com/fuzzypi/claw/internal/store"
 )
 
@@ -622,5 +627,201 @@ func TestStaleJobRecovery(t *testing.T) {
 	}
 	if agent.CurrentJobID != nil {
 		t.Errorf("agent current_job_id = %v, want nil", agent.CurrentJobID)
+	}
+}
+
+// --- Engram Integration Tests ---
+
+func fakeEngramMux(t *testing.T, sessionStarted, sessionEnded, saveCalled *atomic.Int32) *http.ServeMux {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("POST /api/session/start", func(w http.ResponseWriter, r *http.Request) {
+		sessionStarted.Add(1)
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{"session_id": "test-session-id"})
+	})
+	mux.HandleFunc("POST /api/session/end", func(w http.ResponseWriter, r *http.Request) {
+		sessionEnded.Add(1)
+		json.NewEncoder(w).Encode(map[string]any{"ended": true})
+	})
+	mux.HandleFunc("POST /api/mem/save", func(w http.ResponseWriter, r *http.Request) {
+		saveCalled.Add(1)
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]any{"id": 1, "created": true})
+	})
+	mux.HandleFunc("POST /api/mem/search", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	return mux
+}
+
+func TestNewDispatcher_WithoutEngram(t *testing.T) {
+	s := newTestStore(t)
+	d := NewDispatcher(s)
+	if d.engram != nil {
+		t.Error("engram should be nil when not provided")
+	}
+}
+
+func TestNewDispatcher_WithEngram(t *testing.T) {
+	var ss, se, sc atomic.Int32
+	mux := fakeEngramMux(t, &ss, &se, &sc)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	ec := engram.NewClient(engram.Config{URL: ts.URL})
+	s := newTestStore(t)
+	d := NewDispatcher(s, ec)
+	if d.engram == nil {
+		t.Error("engram should not be nil when provided")
+	}
+}
+
+func TestDispatcherSessionLifecycle(t *testing.T) {
+	var sessionStarted, sessionEnded, saveCalled atomic.Int32
+	mux := fakeEngramMux(t, &sessionStarted, &sessionEnded, &saveCalled)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	ec := engram.NewClient(engram.Config{URL: ts.URL})
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("lifecycle-test", "/tmp")
+	s.CreateJob(p.ID, "job-1", "hello")
+	s.RegisterAgent("a1", "shell", strPtr("cat"), nil, nil, nil)
+
+	d := NewDispatcher(s, ec)
+	d.interval = 50 * time.Millisecond
+
+	if err := d.Run(p.ID); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if sessionStarted.Load() != 1 {
+		t.Errorf("session/start calls = %d, want 1", sessionStarted.Load())
+	}
+	if sessionEnded.Load() != 1 {
+		t.Errorf("session/end calls = %d, want 1", sessionEnded.Load())
+	}
+}
+
+func TestDispatcherSaveToEngram(t *testing.T) {
+	var sessionStarted, sessionEnded, saveCalled atomic.Int32
+	mux := fakeEngramMux(t, &sessionStarted, &sessionEnded, &saveCalled)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	ec := engram.NewClient(engram.Config{URL: ts.URL})
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("save-test", "/tmp")
+	s.CreateJob(p.ID, "job-1", "hello")
+	s.RegisterAgent("a1", "shell", strPtr("cat"), nil, nil, nil)
+
+	d := NewDispatcher(s, ec)
+	d.interval = 50 * time.Millisecond
+
+	if err := d.Run(p.ID); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if saveCalled.Load() < 1 {
+		t.Errorf("save calls = %d, want >= 1", saveCalled.Load())
+	}
+}
+
+func TestDispatcherEngramUnavailable(t *testing.T) {
+	// Server returns 500 on health check — client becomes unavailable
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	ec := engram.NewClient(engram.Config{URL: ts.URL})
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("unavail-test", "/tmp")
+	s.CreateJob(p.ID, "job-1", "hello")
+	s.RegisterAgent("a1", "shell", strPtr("cat"), nil, nil, nil)
+
+	d := NewDispatcher(s, ec)
+	d.interval = 50 * time.Millisecond
+
+	// Pipeline should complete normally despite Engram being unavailable
+	if err := d.Run(p.ID); err != nil {
+		t.Fatalf("Run should succeed with unavailable Engram: %v", err)
+	}
+
+	got, _ := s.GetJob(int64(1))
+	if got.Status != "completed" {
+		t.Errorf("job status = %q, want 'completed'", got.Status)
+	}
+}
+
+func TestBuildFullPromptWithEngram_MemoryInjection(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("POST /api/mem/search", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]engram.SearchResult{
+			{ID: 1, Title: "Prior Job Result", Type: "discovery", Snippet: "important context from last run"},
+		})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	ec := engram.NewClient(engram.Config{URL: ts.URL})
+
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("mem-test", "/tmp")
+	j, _ := s.CreateJob(p.ID, "phase-1", "build the thing")
+
+	result := buildFullPromptWithEngram(s, j, ec)
+
+	if !strings.Contains(result, "ENGRAM MEMORY") {
+		t.Error("prompt missing 'ENGRAM MEMORY' section")
+	}
+	if !strings.Contains(result, "Prior Job Result") {
+		t.Error("prompt missing search result title")
+	}
+	if !strings.Contains(result, "important context from last run") {
+		t.Error("prompt missing search result snippet")
+	}
+	if !strings.Contains(result, "build the thing") {
+		t.Error("prompt missing original job prompt")
+	}
+}
+
+func TestBuildFullPromptWithEngram_NilClient(t *testing.T) {
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("nil-test", "/tmp")
+	j, _ := s.CreateJob(p.ID, "job-1", "hello world")
+
+	withEngram := buildFullPromptWithEngram(s, j, nil)
+	withoutEngram := buildFullPrompt(s, j)
+
+	if withEngram != withoutEngram {
+		t.Errorf("nil client prompt mismatch:\n  with:    %q\n  without: %q", withEngram, withoutEngram)
+	}
+}
+
+func TestBuildFullPromptWithEngram_UnavailableClient(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	ec := engram.NewClient(engram.Config{URL: ts.URL})
+
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("unavail-test", "/tmp")
+	j, _ := s.CreateJob(p.ID, "job-1", "hello world")
+
+	result := buildFullPromptWithEngram(s, j, ec)
+	baseline := buildFullPrompt(s, j)
+
+	if result != baseline {
+		t.Errorf("unavailable client prompt mismatch:\n  got:  %q\n  want: %q", result, baseline)
 	}
 }

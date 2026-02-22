@@ -11,12 +11,14 @@ import (
 
 	"github.com/fuzzypi/claw/internal/aos"
 	"github.com/fuzzypi/claw/internal/dispatch"
+	"github.com/fuzzypi/claw/internal/engram"
 	"github.com/fuzzypi/claw/internal/store"
 	"github.com/spf13/cobra"
 )
 
 // RunCmd returns the `claw run <pipeline-id>` command.
-func RunCmd(s *store.Store) *cobra.Command {
+// An optional engram.Client enables memory persistence across runs.
+func RunCmd(s *store.Store, ec ...*engram.Client) *cobra.Command {
 	return &cobra.Command{
 		Use:   "run <pipeline-id>",
 		Short: "Run a pipeline to completion",
@@ -47,7 +49,11 @@ func RunCmd(s *store.Store) *cobra.Command {
 				return fmt.Errorf("no idle agents registered — register at least one agent first")
 			}
 
-			d := dispatch.NewDispatcher(s)
+			var engramClient *engram.Client
+			if len(ec) > 0 {
+				engramClient = ec[0]
+			}
+			d := dispatch.NewDispatcher(s, engramClient)
 			if err := d.Run(id); err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Pipeline failed: %v\n", err)
 				return err

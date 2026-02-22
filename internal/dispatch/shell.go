@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/fuzzypi/claw/internal/engram"
 	"github.com/fuzzypi/claw/internal/gates"
 	"github.com/fuzzypi/claw/internal/store"
 )
@@ -19,6 +21,10 @@ const keepBytes = 262_144
 // ExecuteShell runs the agent's command with the job prompt piped via stdin.
 // Accumulated pipeline context is prepended to the prompt.
 func ExecuteShell(s *store.Store, job *store.Job, agent *store.Agent) error {
+	return executeShellWithEngram(s, job, agent, nil)
+}
+
+func executeShellWithEngram(s *store.Store, job *store.Job, agent *store.Agent, ec *engram.Client) error {
 	if agent.Command == nil {
 		return fmt.Errorf("agent %q has no command configured", agent.Name)
 	}
@@ -42,8 +48,8 @@ func ExecuteShell(s *store.Store, job *store.Job, agent *store.Agent) error {
 		}
 	}
 
-	// Build full prompt with context injection
-	fullPrompt := buildFullPrompt(s, job)
+	// Build full prompt with context + memory injection
+	fullPrompt := buildFullPromptWithEngram(s, job, ec)
 	cmd.Stdin = strings.NewReader(fullPrompt)
 
 	var combined bytes.Buffer
@@ -83,18 +89,52 @@ func ExecuteShell(s *store.Store, job *store.Job, agent *store.Agent) error {
 }
 
 func buildFullPrompt(s *store.Store, job *store.Job) string {
+	return buildFullPromptWithEngram(s, job, nil)
+}
+
+func buildFullPromptWithEngram(s *store.Store, job *store.Job, ec *engram.Client) string {
+	// Memory injection from Engram (prior runs)
+	memorySection := ""
+	if ec != nil && ec.Available() {
+		pipeline, pErr := s.GetPipeline(job.PipelineID)
+		if pErr == nil {
+			project := filepath.Base(pipeline.ProjectDir)
+			results, sErr := ec.Search(job.Name, project, 5)
+			if sErr == nil && len(results) > 0 {
+				var sb strings.Builder
+				sb.WriteString("--- ENGRAM MEMORY (prior runs) ---\n")
+				for i, r := range results {
+					sb.WriteString(fmt.Sprintf("[%d] %s: %s\n", i+1, r.Title, r.Snippet))
+				}
+				sb.WriteString("---\n")
+				memorySection = sb.String()
+			}
+		}
+	}
+
+	// Pipeline context (existing behavior)
+	pipelineHeader := ""
 	entries, err := s.ListContextByPipeline(job.PipelineID)
-	if err != nil || len(entries) == 0 {
-		return job.Prompt
+	if err == nil && len(entries) > 0 {
+		contents := make([]string, len(entries))
+		for i, e := range entries {
+			contents[i] = e.Content
+		}
+		pipelineHeader = gates.BuildContextHeader(contents)
 	}
 
-	contents := make([]string, len(entries))
-	for i, e := range entries {
-		contents[i] = e.Content
+	// Order: memory first, then pipeline context, then prompt
+	var sb strings.Builder
+	if memorySection != "" {
+		sb.WriteString(memorySection)
+		sb.WriteString("\n")
 	}
-
-	header := gates.BuildContextHeader(contents)
-	return header + "\n" + job.Prompt
+	if pipelineHeader != "" {
+		sb.WriteString(pipelineHeader)
+		sb.WriteString("\n")
+	}
+	sb.WriteString(job.Prompt)
+	return sb.String()
 }
 
 func filterThroughRTK(output string) (string, string) {
