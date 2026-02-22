@@ -1,0 +1,17 @@
+{
+  "name": "claw",
+  "version": "0.0.1",
+  "description": "AOS-governed project: claw",
+  "type": "module",
+  "scripts": {
+    "verify:repo": "node verify/repo.verify.cjs",
+    "verify:blueprint": "node verify/blueprint.verify.cjs",
+    "verify:all": "npm run verify:repo && npm run verify:blueprint"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
