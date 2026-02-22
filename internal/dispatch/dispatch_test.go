@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,17 @@ func newTestStore(t *testing.T) *store.Store {
 
 func strPtr(s string) *string { return &s }
 func intPtr(i int) *int       { return &i }
+
+// writeFakeRTK creates a temp directory with a fake rtk script and returns the dir path.
+func writeFakeRTK(t *testing.T, script string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rtk")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake rtk: %v", err)
+	}
+	return dir
+}
 
 func TestShellExecutorBasic(t *testing.T) {
 	s := newTestStore(t)
@@ -312,8 +324,7 @@ func TestDispatcherParallelJobs(t *testing.T) {
 }
 
 func TestDispatcherFailedJobHaltsPipeline(t *testing.T) {
-	os.Setenv("CLAW_MAX_RETRIES", "0")
-	defer os.Unsetenv("CLAW_MAX_RETRIES")
+	t.Setenv("CLAW_MAX_RETRIES", "0")
 
 	s := newTestStore(t)
 	p, _ := s.CreatePipeline("p", "/tmp")
@@ -344,8 +355,7 @@ func TestDispatcherFailedJobHaltsPipeline(t *testing.T) {
 }
 
 func TestDispatcherRetryPolicy(t *testing.T) {
-	os.Setenv("CLAW_MAX_RETRIES", "2")
-	defer os.Unsetenv("CLAW_MAX_RETRIES")
+	t.Setenv("CLAW_MAX_RETRIES", "2")
 
 	s := newTestStore(t)
 	p, _ := s.CreatePipeline("p", "/tmp")
@@ -398,8 +408,7 @@ func TestDispatcherWithGate(t *testing.T) {
 }
 
 func TestDispatcherGateFailHaltsPipeline(t *testing.T) {
-	os.Setenv("CLAW_MAX_RETRIES", "0")
-	defer os.Unsetenv("CLAW_MAX_RETRIES")
+	t.Setenv("CLAW_MAX_RETRIES", "0")
 
 	s := newTestStore(t)
 	p, _ := s.CreatePipeline("p", "/tmp")
@@ -491,9 +500,104 @@ func TestDispatcherContextInjection(t *testing.T) {
 	}
 }
 
+func TestFilterThroughRTK_NoRTKOnPath(t *testing.T) {
+	t.Setenv("PATH", "/nonexistent")
+
+	input := "hello\nworld"
+	output, stats := filterThroughRTK(input)
+
+	if output != input {
+		t.Errorf("output = %q, want %q", output, input)
+	}
+	if stats != "" {
+		t.Errorf("stats = %q, want empty string", stats)
+	}
+}
+
+func TestFilterThroughRTK_RTKFailureFallback(t *testing.T) {
+	dir := writeFakeRTK(t, "#!/bin/sh\nexit 1\n")
+	t.Setenv("PATH", dir)
+
+	input := "line1\nline2\nline3"
+	output, stats := filterThroughRTK(input)
+
+	if output != input {
+		t.Errorf("output = %q, want exact passthrough %q", output, input)
+	}
+	if stats != "" {
+		t.Errorf("stats = %q, want empty on failure", stats)
+	}
+}
+
+func TestExecuteShell_RTKSuccess(t *testing.T) {
+	// Fake rtk: reads stdin (discards), writes filtered output to stdout, stats to stderr
+	dir := writeFakeRTK(t, "#!/bin/sh\ncat >/dev/null\necho \"FILTERED_OUTPUT\"\necho \"tokens_in=100 tokens_out=50\" >&2\n")
+	t.Setenv("PATH", dir+":/usr/bin:/bin")
+
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("p", "/tmp")
+	j, _ := s.CreateJob(p.ID, "rtk-test", "raw input")
+	a, _ := s.RegisterAgent("a1", "shell", strPtr("cat"), nil, nil, nil)
+
+	err := ExecuteShell(s, j, a)
+	if err != nil {
+		t.Fatalf("ExecuteShell: %v", err)
+	}
+
+	got, _ := s.GetJob(j.ID)
+	if got.Output == nil {
+		t.Fatal("output is nil")
+	}
+	if !strings.Contains(*got.Output, "FILTERED_OUTPUT") {
+		t.Errorf("stored output = %q, want containing 'FILTERED_OUTPUT'", *got.Output)
+	}
+
+	// Verify activity log contains rtk_filtered event
+	entries, err := s.ListActivity(&p.ID, 10)
+	if err != nil {
+		t.Fatalf("ListActivity: %v", err)
+	}
+	found := false
+	for _, e := range entries {
+		if e.Event == "rtk_filtered" && strings.Contains(e.Detail, "tokens_in=100") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("activity_log missing rtk_filtered event with stats")
+	}
+}
+
+func TestFilterThroughRTK_OrderingBeforeTruncate(t *testing.T) {
+	// Fake rtk: discards stdin, emits >1MB to stdout so truncation must fire
+	dir := writeFakeRTK(t, "#!/bin/sh\ncat >/dev/null\nhead -c 2000000 /dev/zero | tr '\\0' 'y'\n")
+	t.Setenv("PATH", dir+":/usr/bin:/bin")
+
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("p", "/tmp")
+	j, _ := s.CreateJob(p.ID, "ordering-test", "small input")
+	a, _ := s.RegisterAgent("a1", "shell", strPtr("cat"), nil, nil, nil)
+
+	err := ExecuteShell(s, j, a)
+	if err != nil {
+		t.Fatalf("ExecuteShell: %v", err)
+	}
+
+	got, _ := s.GetJob(j.ID)
+	if got.Output == nil {
+		t.Fatal("output is nil")
+	}
+	if !strings.Contains(*got.Output, "[... truncated") {
+		t.Error("truncation marker not found — filterThroughRTK must run before truncateOutput")
+	}
+	if len(*got.Output) > 1_100_000 {
+		t.Errorf("output len = %d, want < 1.1MB after truncation", len(*got.Output))
+	}
+}
+
 func TestStaleJobRecovery(t *testing.T) {
-	os.Setenv("CLAW_MAX_RETRIES", "1")
-	defer os.Unsetenv("CLAW_MAX_RETRIES")
+	t.Setenv("CLAW_MAX_RETRIES", "1")
 
 	s := newTestStore(t)
 	p, _ := s.CreatePipeline("p", "/tmp")

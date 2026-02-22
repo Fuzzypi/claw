@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 	"time"
@@ -61,7 +62,15 @@ func ExecuteShell(s *store.Store, job *store.Job, agent *store.Agent) error {
 	}
 
 	output := combined.String()
+	output, rtkStats := filterThroughRTK(output)
 	output = truncateOutput(output)
+
+	if rtkStats != "" {
+		log.Printf("[claw] %s", rtkStats)
+		if logErr := s.LogActivity(&job.PipelineID, &job.ID, nil, "rtk_filtered", rtkStats); logErr != nil {
+			log.Printf("[claw] activity log error: %v", logErr)
+		}
+	}
 
 	if storeErr := s.SetJobOutput(job.ID, output, exitCode); storeErr != nil {
 		return storeErr
@@ -86,6 +95,30 @@ func buildFullPrompt(s *store.Store, job *store.Job) string {
 
 	header := gates.BuildContextHeader(contents)
 	return header + "\n" + job.Prompt
+}
+
+func filterThroughRTK(output string) (string, string) {
+	_, err := exec.LookPath("rtk")
+	if err != nil {
+		return output, ""
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "rtk", "--stats")
+	cmd.Stdin = strings.NewReader(output)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		log.Printf("[claw] rtk filter failed: %v", err)
+		return output, ""
+	}
+
+	return stdout.String(), strings.TrimSpace(stderr.String())
 }
 
 func truncateOutput(output string) string {
