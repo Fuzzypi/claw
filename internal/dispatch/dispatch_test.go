@@ -630,6 +630,182 @@ func TestStaleJobRecovery(t *testing.T) {
 	}
 }
 
+// --- Governance Tests ---
+
+func TestExtractPhaseFromName(t *testing.T) {
+	tests := []struct {
+		name string
+		want int
+	}{
+		{"phase-1-store", 1},
+		{"phase-2-dispatch", 2},
+		{"phase_3_context", 3},
+		{"Phase-10-big", 10},
+		{"no-phase-here", -1},
+		{"something", -1},
+	}
+	for _, tt := range tests {
+		got := extractPhaseFromName(tt.name)
+		if got != tt.want {
+			t.Errorf("extractPhaseFromName(%q) = %d, want %d", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestGovernanceBlocksDispatch(t *testing.T) {
+	t.Setenv("CLAW_MAX_RETRIES", "0")
+
+	// Set up project with gates
+	tmpDir := t.TempDir()
+	setupGovernanceProject(t, tmpDir)
+
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("gov-test", tmpDir)
+
+	// Phase 1 job — completed but gate failed
+	phase1 := 1
+	j1, _ := s.CreateJobWithPhase(p.ID, "phase-1-store", "build store", &phase1)
+	s.SetJobGateCommand(j1.ID, "npm run verify:test:phase01")
+	s.UpdateJobStatus(j1.ID, "completed")
+	s.SetJobGateResult(j1.ID, "tests failed", 1, "failed")
+	s.SetJobCompleted(j1.ID)
+
+	// Phase 2 job — should be blocked by governance
+	phase2 := 2
+	s.CreateJobWithPhase(p.ID, "phase-2-dispatch", "build dispatch", &phase2)
+	s.SetJobGateCommand(int64(2), "npm run verify:test:phase02")
+
+	s.RegisterAgent("a1", "shell", strPtr("cat"), nil, nil, nil)
+
+	d := NewDispatcher(s)
+	d.interval = 50 * time.Millisecond
+
+	err := d.Run(p.ID)
+	if err == nil {
+		t.Fatal("expected pipeline error from governance violation")
+	}
+
+	j2, _ := s.GetJob(int64(2))
+	if j2.Status != "failed" {
+		t.Errorf("phase-2 status = %q, want 'failed'", j2.Status)
+	}
+	if j2.Output == nil || !strings.Contains(*j2.Output, "governance violation") {
+		t.Errorf("phase-2 output = %v, want containing 'governance violation'", j2.Output)
+	}
+
+	// Verify governance_violation event in activity log
+	entries, _ := s.ListActivity(&p.ID, 50)
+	found := false
+	for _, e := range entries {
+		if e.Event == "governance_violation" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("activity log missing 'governance_violation' event")
+	}
+}
+
+func TestGovernancePasses(t *testing.T) {
+	tmpDir := t.TempDir()
+	setupGovernanceProject(t, tmpDir)
+
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("gov-pass", tmpDir)
+
+	// Phase 1 job — completed with gate passed
+	phase1 := 1
+	j1, _ := s.CreateJobWithPhase(p.ID, "phase-1-store", "build store", &phase1)
+	s.SetJobGateCommand(j1.ID, "npm run verify:test:phase01")
+	s.UpdateJobStatus(j1.ID, "completed")
+	s.SetJobGateResult(j1.ID, "all passed", 0, "passed")
+	s.SetJobCompleted(j1.ID)
+
+	// Phase 2 job — should pass governance and execute
+	phase2 := 2
+	j2, _ := s.CreateJobWithPhase(p.ID, "phase-2-dispatch", "echo hello", &phase2)
+	s.SetJobGateCommand(j2.ID, "sh -c 'exit 0'")
+
+	s.RegisterAgent("a1", "shell", strPtr("cat"), nil, nil, nil)
+
+	d := NewDispatcher(s)
+	d.interval = 50 * time.Millisecond
+
+	if err := d.Run(p.ID); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	got, _ := s.GetJob(j2.ID)
+	if got.Status != "completed" {
+		t.Errorf("phase-2 status = %q, want 'completed'", got.Status)
+	}
+}
+
+func TestGovernanceAuditToEngram(t *testing.T) {
+	tmpDir := t.TempDir()
+	setupGovernanceProject(t, tmpDir)
+
+	var sessionStarted, sessionEnded, saveCalled atomic.Int32
+	mux := fakeEngramMux(t, &sessionStarted, &sessionEnded, &saveCalled)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	ec := engram.NewClient(engram.Config{URL: ts.URL})
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("gov-engram", tmpDir)
+
+	// Phase 1 passed
+	phase1 := 1
+	j1, _ := s.CreateJobWithPhase(p.ID, "phase-1-store", "build store", &phase1)
+	s.SetJobGateCommand(j1.ID, "npm run verify:test:phase01")
+	s.UpdateJobStatus(j1.ID, "completed")
+	s.SetJobGateResult(j1.ID, "all passed", 0, "passed")
+	s.SetJobCompleted(j1.ID)
+
+	// Phase 2 job
+	phase2 := 2
+	j2, _ := s.CreateJobWithPhase(p.ID, "phase-2-dispatch", "echo hello", &phase2)
+	s.SetJobGateCommand(j2.ID, "sh -c 'exit 0'")
+
+	s.RegisterAgent("a1", "shell", strPtr("cat"), nil, nil, nil)
+
+	d := NewDispatcher(s, ec)
+	d.interval = 50 * time.Millisecond
+
+	if err := d.Run(p.ID); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Governance decisions + job context saves should have called /api/mem/save
+	if saveCalled.Load() < 2 {
+		t.Errorf("save calls = %d, want >= 2 (governance + job context)", saveCalled.Load())
+	}
+}
+
+func setupGovernanceProject(t *testing.T, tmpDir string) {
+	t.Helper()
+	os.MkdirAll(filepath.Join(tmpDir, ".aos"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "docs", "plan"), 0755)
+
+	os.WriteFile(filepath.Join(tmpDir, ".aos", "GATES.md"), []byte(`| Gate | Script | Phase |
+|------|--------|-------|
+| store | `+"`verify/test_phase01.verify.cjs`"+` | 1 |
+| dispatch | `+"`verify/test_phase02.verify.cjs`"+` | 2 |
+`), 0644)
+
+	os.WriteFile(filepath.Join(tmpDir, "docs", "plan", "TEST_PHASE_PLAN.md"), []byte(`## Phase 1 — Store
+## Phase 2 — Dispatch
+`), 0644)
+
+	os.WriteFile(filepath.Join(tmpDir, "package.json"), []byte(`{
+  "scripts": {
+    "verify:test:phase01": "node verify/test_phase01.verify.cjs",
+    "verify:test:phase02": "node verify/test_phase02.verify.cjs"
+  }
+}`), 0644)
+}
+
 // --- Engram Integration Tests ---
 
 func fakeEngramMux(t *testing.T, sessionStarted, sessionEnded, saveCalled *atomic.Int32) *http.ServeMux {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -36,6 +37,7 @@ type ProjectInfo struct {
 	Gates   []GateEntry
 	Phases  []PhaseEntry
 	Scripts []VerifyScript
+	Laws    []Law
 }
 
 // ReadProject orchestrates reading all AOS governance files from a project directory.
@@ -56,10 +58,17 @@ func ReadProject(projectDir string) (*ProjectInfo, error) {
 		return nil, fmt.Errorf("reading verify scripts: %w", err)
 	}
 
+	laws, err := ReadLaws(projectDir)
+	if err != nil {
+		log.Printf("[claw] warning: failed to read laws: %v", err)
+		laws = nil
+	}
+
 	return &ProjectInfo{
 		Gates:   gates,
 		Phases:  phases,
 		Scripts: scripts,
+		Laws:    laws,
 	}, nil
 }
 

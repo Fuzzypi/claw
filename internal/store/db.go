@@ -95,6 +95,7 @@ func (s *Store) migrate() error {
 			gate_output TEXT,
 			output TEXT,
 			exit_code INTEGER,
+			phase_number INTEGER,
 			attempt_count INTEGER NOT NULL DEFAULT 0,
 			lease_expires_at DATETIME,
 			started_at DATETIME,
@@ -139,5 +140,46 @@ func (s *Store) migrate() error {
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Idempotent migration: add phase_number to existing DBs
+	if err := s.migrateAddPhaseNumber(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Store) migrateAddPhaseNumber() error {
+	rows, err := s.db.Query(`PRAGMA table_info(jobs)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	hasPhaseNumber := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull int
+		var dfltValue *string
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dfltValue, &pk); err != nil {
+			return err
+		}
+		if name == "phase_number" {
+			hasPhaseNumber = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if !hasPhaseNumber {
+		_, err := s.db.Exec(`ALTER TABLE jobs ADD COLUMN phase_number INTEGER`)
+		return err
+	}
+	return nil
 }

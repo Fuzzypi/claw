@@ -5,10 +5,13 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/fuzzypi/claw/internal/aos"
 	clawctx "github.com/fuzzypi/claw/internal/context"
 	"github.com/fuzzypi/claw/internal/engram"
 	"github.com/fuzzypi/claw/internal/gates"
@@ -22,6 +25,34 @@ type Dispatcher struct {
 	mu        sync.Mutex
 	engram    *engram.Client
 	sessionID string
+
+	// Governance cache (populated per pipeline)
+	govCache map[int64]*governanceInfo
+}
+
+type governanceInfo struct {
+	gateMap map[int]string
+	project string
+}
+
+var phaseNameRe = regexp.MustCompile(`(?i)phase[-_](\d+)`)
+
+func extractPhaseFromName(name string) int {
+	m := phaseNameRe.FindStringSubmatch(name)
+	if m == nil {
+		return -1
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+func sanitizeTopicKey(s string) string {
+	s = strings.ToLower(s)
+	s = strings.ReplaceAll(s, " ", "_")
+	return s
 }
 
 // NewDispatcher creates a new dispatcher with a 1-second poll interval.
@@ -112,10 +143,17 @@ func (d *Dispatcher) Run(pipelineID int64) error {
 		}
 
 		// Assign jobs to agents
-		pairs := min(len(ready), len(idle))
-		for i := 0; i < pairs; i++ {
+		agentIdx := 0
+		for i := 0; i < len(ready) && agentIdx < len(idle); i++ {
 			job := ready[i]
-			agent := idle[i]
+
+			// Governance pre-dispatch check
+			if check := d.checkGovernance(job, pipelineID); check != nil {
+				continue
+			}
+
+			agent := idle[agentIdx]
+			agentIdx++
 
 			leaseExpires := time.Now().Add(time.Duration(agent.TimeoutSecs) * time.Second)
 			if err := d.store.AssignJobToAgent(job.ID, agent.ID, leaseExpires); err != nil {
@@ -333,6 +371,129 @@ func (d *Dispatcher) saveToEngram(job *store.Job) {
 			"decision", gateContent, gateTopicKey, "project", project, d.sessionID,
 		)
 	}
+}
+
+func (d *Dispatcher) loadGovernance(pipelineID int64) *governanceInfo {
+	if d.govCache == nil {
+		d.govCache = make(map[int64]*governanceInfo)
+	}
+	if gi, ok := d.govCache[pipelineID]; ok {
+		return gi
+	}
+
+	pipeline, err := d.store.GetPipeline(pipelineID)
+	if err != nil {
+		return nil
+	}
+
+	info, err := aos.ReadProject(pipeline.ProjectDir)
+	if err != nil {
+		log.Printf("[claw] governance: failed to read project: %v", err)
+		return nil
+	}
+
+	gateMap := aos.MapGatesToScripts(info.Gates, info.Scripts)
+	gi := &governanceInfo{
+		gateMap: gateMap,
+		project: filepath.Base(pipeline.ProjectDir),
+	}
+	d.govCache[pipelineID] = gi
+	return gi
+}
+
+func (d *Dispatcher) checkGovernance(job *store.Job, pipelineID int64) *aos.GovernanceCheck {
+	gi := d.loadGovernance(pipelineID)
+	if gi == nil || len(gi.gateMap) == 0 {
+		return nil
+	}
+
+	// Determine phase
+	phase := -1
+	if job.PhaseNumber != nil {
+		phase = *job.PhaseNumber
+	} else {
+		phase = extractPhaseFromName(job.Name)
+		if phase >= 0 {
+			log.Printf("[claw] governance: job %q has no phase_number, parsed %d from name", job.Name, phase)
+		}
+	}
+
+	// Build priorJobs
+	allJobs, err := d.store.ListJobsByPipeline(pipelineID)
+	if err != nil {
+		return nil
+	}
+
+	var priorJobs []aos.JobPhaseInfo
+	for _, j := range allJobs {
+		jp := -1
+		if j.PhaseNumber != nil {
+			jp = *j.PhaseNumber
+		} else {
+			jp = extractPhaseFromName(j.Name)
+		}
+		gs := ""
+		if j.GateStatus != nil {
+			gs = *j.GateStatus
+		}
+		gc := ""
+		if j.GateCommand != nil {
+			gc = *j.GateCommand
+		}
+		priorJobs = append(priorJobs, aos.JobPhaseInfo{
+			Name:        j.Name,
+			Phase:       jp,
+			GateStatus:  gs,
+			GateCommand: gc,
+		})
+	}
+
+	// Check gate integrity
+	gc := ""
+	if job.GateCommand != nil {
+		gc = *job.GateCommand
+	}
+	giCheck := aos.CheckGateIntegrity(job.Name, phase, gi.gateMap, gc)
+	d.persistGovernanceDecision(pipelineID, job, &giCheck, gi.project)
+	if !giCheck.Passed {
+		d.failGovernance(job, &giCheck)
+		return &giCheck
+	}
+
+	// Check phase lock
+	plCheck := aos.CheckPhaseLock(job.Name, phase, gi.gateMap, priorJobs)
+	d.persistGovernanceDecision(pipelineID, job, &plCheck, gi.project)
+	if !plCheck.Passed {
+		d.failGovernance(job, &plCheck)
+		return &plCheck
+	}
+
+	return nil
+}
+
+func (d *Dispatcher) failGovernance(job *store.Job, check *aos.GovernanceCheck) {
+	_ = d.store.SetJobOutput(job.ID, fmt.Sprintf("[governance violation] %s: %s", check.LawID, check.Reason), -1)
+	_ = d.store.UpdateJobStatus(job.ID, "failed")
+	_ = d.store.SetJobCompleted(job.ID)
+	d.logActivity(&job.PipelineID, &job.ID, nil, "governance_violation",
+		fmt.Sprintf("Job %q blocked by %s: %s", job.Name, check.LawID, check.Reason))
+}
+
+func (d *Dispatcher) persistGovernanceDecision(pipelineID int64, job *store.Job, check *aos.GovernanceCheck, project string) {
+	if d.engram == nil || !d.engram.Available() {
+		return
+	}
+
+	status := "PASSED"
+	if !check.Passed {
+		status = "FAILED"
+	}
+
+	topicKey := sanitizeTopicKey(fmt.Sprintf("governance_%s_%s", check.LawID, job.Name))
+	d.engram.Save(
+		fmt.Sprintf("Governance: %s [%s] %s", check.LawID, status, job.Name),
+		"decision", check.Reason, topicKey, "project", project, d.sessionID,
+	)
 }
 
 // RecoverStaleJobs resets timed-out jobs and frees their agents.

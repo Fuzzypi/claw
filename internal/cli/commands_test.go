@@ -161,6 +161,58 @@ func TestJobAddCmd(t *testing.T) {
 	}
 }
 
+func TestJobAddWithPhase(t *testing.T) {
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("p", "/tmp")
+
+	tmpDir := t.TempDir()
+	promptFile := filepath.Join(tmpDir, "prompt.txt")
+	os.WriteFile(promptFile, []byte("Build phase 3"), 0644)
+
+	cmd := JobAddCmd(s)
+	out := &bytes.Buffer{}
+	cmd.SetOut(out)
+	cmd.SetArgs([]string{"1", "phase-3-context", "--prompt-file", promptFile, "--phase", "3"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	jobs, _ := s.ListJobsByPipeline(p.ID)
+	if len(jobs) != 1 {
+		t.Fatalf("job count = %d, want 1", len(jobs))
+	}
+	if jobs[0].PhaseNumber == nil || *jobs[0].PhaseNumber != 3 {
+		t.Errorf("PhaseNumber = %v, want 3", jobs[0].PhaseNumber)
+	}
+}
+
+func TestJobAddWithoutPhase(t *testing.T) {
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("p", "/tmp")
+
+	tmpDir := t.TempDir()
+	promptFile := filepath.Join(tmpDir, "prompt.txt")
+	os.WriteFile(promptFile, []byte("No phase"), 0644)
+
+	cmd := JobAddCmd(s)
+	out := &bytes.Buffer{}
+	cmd.SetOut(out)
+	cmd.SetArgs([]string{"1", "no-phase-job", "--prompt-file", promptFile})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	jobs, _ := s.ListJobsByPipeline(p.ID)
+	if len(jobs) != 1 {
+		t.Fatalf("job count = %d, want 1", len(jobs))
+	}
+	if jobs[0].PhaseNumber != nil {
+		t.Errorf("PhaseNumber = %v, want nil", jobs[0].PhaseNumber)
+	}
+}
+
 func TestJobAddWithDependency(t *testing.T) {
 	s := newTestStore(t)
 	p, _ := s.CreatePipeline("p", "/tmp")

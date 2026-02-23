@@ -420,6 +420,61 @@ func jobNames(jobs []*Job) []string {
 	return names
 }
 
+func TestCreateJobWithPhase(t *testing.T) {
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("p", "/tmp")
+	phase := 3
+	j, err := s.CreateJobWithPhase(p.ID, "phase-3-test", "do stuff", &phase)
+	if err != nil {
+		t.Fatalf("CreateJobWithPhase: %v", err)
+	}
+	got, _ := s.GetJob(j.ID)
+	if got.PhaseNumber == nil || *got.PhaseNumber != 3 {
+		t.Errorf("PhaseNumber = %v, want 3", got.PhaseNumber)
+	}
+}
+
+func TestCreateJobWithPhaseNil(t *testing.T) {
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("p", "/tmp")
+	j, err := s.CreateJobWithPhase(p.ID, "no-phase", "do stuff", nil)
+	if err != nil {
+		t.Fatalf("CreateJobWithPhase: %v", err)
+	}
+	got, _ := s.GetJob(j.ID)
+	if got.PhaseNumber != nil {
+		t.Errorf("PhaseNumber = %v, want nil", got.PhaseNumber)
+	}
+}
+
+func TestCreateJobBackwardCompatible(t *testing.T) {
+	s := newTestStore(t)
+	p, _ := s.CreatePipeline("p", "/tmp")
+	j, err := s.CreateJob(p.ID, "old-style", "prompt")
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	got, _ := s.GetJob(j.ID)
+	if got.PhaseNumber != nil {
+		t.Errorf("PhaseNumber = %v, want nil", got.PhaseNumber)
+	}
+	if got.Name != "old-style" {
+		t.Errorf("Name = %q, want 'old-style'", got.Name)
+	}
+}
+
+func TestMigrationIdempotency(t *testing.T) {
+	s := newTestStore(t)
+	// Opening again with the same DB should not fail
+	// (the migration is idempotent — column already exists)
+	phase := 1
+	p, _ := s.CreatePipeline("p", "/tmp")
+	_, err := s.CreateJobWithPhase(p.ID, "test", "prompt", &phase)
+	if err != nil {
+		t.Fatalf("CreateJobWithPhase after re-open: %v", err)
+	}
+}
+
 func TestLogActivity(t *testing.T) {
 	s := newTestStore(t)
 	p, _ := s.CreatePipeline("p", "/tmp")

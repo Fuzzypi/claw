@@ -165,13 +165,14 @@ func JobAddCmd(s *store.Store) *cobra.Command {
 	var promptFile string
 	var dependsOn []string
 	var gate string
+	var phase int
 
 	cmd := &cobra.Command{
 		Use:   "add <pipeline-id> <name>",
 		Short: "Add a job to a pipeline",
 		Long: "Add a job with a prompt file to a pipeline.\n" +
-			"Optionally specify dependencies and a gate command.\n\n" +
-			"Example:\n  claw job add 1 phase-1 --prompt-file prompt.txt --gate \"npm run verify:phase01\"",
+			"Optionally specify dependencies, a gate command, and phase number.\n\n" +
+			"Example:\n  claw job add 1 phase-1 --prompt-file prompt.txt --gate \"npm run verify:phase01\" --phase 1",
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pipelineID, err := strconv.ParseInt(args[0], 10, 64)
@@ -185,7 +186,12 @@ func JobAddCmd(s *store.Store) *cobra.Command {
 				return fmt.Errorf("reading prompt file: %w", err)
 			}
 
-			j, err := s.CreateJob(pipelineID, name, string(promptData))
+			var phasePtr *int
+			if phase >= 0 {
+				phasePtr = &phase
+			}
+
+			j, err := s.CreateJobWithPhase(pipelineID, name, string(promptData), phasePtr)
 			if err != nil {
 				return err
 			}
@@ -214,6 +220,7 @@ func JobAddCmd(s *store.Store) *cobra.Command {
 	cmd.MarkFlagRequired("prompt-file")
 	cmd.Flags().StringArrayVar(&dependsOn, "depends-on", nil, "Job name this depends on (repeatable)")
 	cmd.Flags().StringVar(&gate, "gate", "", "Gate command to run after job completes")
+	cmd.Flags().IntVar(&phase, "phase", -1, "Phase number for governance enforcement")
 	return cmd
 }
 
@@ -557,7 +564,8 @@ func InitCmd(s *store.Store) *cobra.Command {
 				jobName := fmt.Sprintf("phase-%d-%s", phase.Number, sanitizeName(phase.Name))
 				prompt := fmt.Sprintf("Phase %d: %s", phase.Number, phase.Name)
 
-				j, err := s.CreateJob(p.ID, jobName, prompt)
+				phaseNum := phase.Number
+				j, err := s.CreateJobWithPhase(p.ID, jobName, prompt, &phaseNum)
 				if err != nil {
 					return fmt.Errorf("creating job %q: %w", jobName, err)
 				}

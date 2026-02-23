@@ -20,6 +20,7 @@ type Job struct {
 	GateOutput     *string
 	Output         *string
 	ExitCode       *int
+	PhaseNumber    *int
 	AttemptCount   int
 	LeaseExpiresAt *time.Time
 	StartedAt      *time.Time
@@ -32,9 +33,14 @@ const keepBytes = 262_144
 
 // CreateJob inserts a new job into the given pipeline.
 func (s *Store) CreateJob(pipelineID int64, name, prompt string) (*Job, error) {
+	return s.CreateJobWithPhase(pipelineID, name, prompt, nil)
+}
+
+// CreateJobWithPhase inserts a new job with an optional phase number.
+func (s *Store) CreateJobWithPhase(pipelineID int64, name, prompt string, phaseNumber *int) (*Job, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO jobs (pipeline_id, name, prompt) VALUES (?, ?, ?)`,
-		pipelineID, name, prompt,
+		`INSERT INTO jobs (pipeline_id, name, prompt, phase_number) VALUES (?, ?, ?, ?)`,
+		pipelineID, name, prompt, phaseNumber,
 	)
 	if err != nil {
 		return nil, err
@@ -52,13 +58,13 @@ func (s *Store) GetJob(id int64) (*Job, error) {
 	err := s.db.QueryRow(
 		`SELECT id, pipeline_id, name, prompt, status, agent_id,
 			gate_command, gate_status, gate_exit_code, gate_output,
-			output, exit_code, attempt_count, lease_expires_at,
+			output, exit_code, phase_number, attempt_count, lease_expires_at,
 			started_at, completed_at, created_at
 		FROM jobs WHERE id = ?`, id,
 	).Scan(
 		&j.ID, &j.PipelineID, &j.Name, &j.Prompt, &j.Status, &j.AgentID,
 		&j.GateCommand, &j.GateStatus, &j.GateExitCode, &j.GateOutput,
-		&j.Output, &j.ExitCode, &j.AttemptCount, &j.LeaseExpiresAt,
+		&j.Output, &j.ExitCode, &j.PhaseNumber, &j.AttemptCount, &j.LeaseExpiresAt,
 		&j.StartedAt, &j.CompletedAt, &j.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -72,7 +78,7 @@ func (s *Store) ListJobsByPipeline(pipelineID int64) ([]*Job, error) {
 	rows, err := s.db.Query(
 		`SELECT id, pipeline_id, name, prompt, status, agent_id,
 			gate_command, gate_status, gate_exit_code, gate_output,
-			output, exit_code, attempt_count, lease_expires_at,
+			output, exit_code, phase_number, attempt_count, lease_expires_at,
 			started_at, completed_at, created_at
 		FROM jobs WHERE pipeline_id = ? ORDER BY id`, pipelineID,
 	)
@@ -87,7 +93,7 @@ func (s *Store) ListJobsByPipeline(pipelineID int64) ([]*Job, error) {
 		if err := rows.Scan(
 			&j.ID, &j.PipelineID, &j.Name, &j.Prompt, &j.Status, &j.AgentID,
 			&j.GateCommand, &j.GateStatus, &j.GateExitCode, &j.GateOutput,
-			&j.Output, &j.ExitCode, &j.AttemptCount, &j.LeaseExpiresAt,
+			&j.Output, &j.ExitCode, &j.PhaseNumber, &j.AttemptCount, &j.LeaseExpiresAt,
 			&j.StartedAt, &j.CompletedAt, &j.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -150,7 +156,7 @@ func (s *Store) GetStaleJobs() ([]*Job, error) {
 	rows, err := s.db.Query(
 		`SELECT id, pipeline_id, name, prompt, status, agent_id,
 			gate_command, gate_status, gate_exit_code, gate_output,
-			output, exit_code, attempt_count, lease_expires_at,
+			output, exit_code, phase_number, attempt_count, lease_expires_at,
 			started_at, completed_at, created_at
 		FROM jobs
 		WHERE status IN ('dispatched', 'running')
@@ -168,7 +174,7 @@ func (s *Store) GetStaleJobs() ([]*Job, error) {
 		if err := rows.Scan(
 			&j.ID, &j.PipelineID, &j.Name, &j.Prompt, &j.Status, &j.AgentID,
 			&j.GateCommand, &j.GateStatus, &j.GateExitCode, &j.GateOutput,
-			&j.Output, &j.ExitCode, &j.AttemptCount, &j.LeaseExpiresAt,
+			&j.Output, &j.ExitCode, &j.PhaseNumber, &j.AttemptCount, &j.LeaseExpiresAt,
 			&j.StartedAt, &j.CompletedAt, &j.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -218,13 +224,13 @@ func (s *Store) GetJobByName(pipelineID int64, name string) (*Job, error) {
 	err := s.db.QueryRow(
 		`SELECT id, pipeline_id, name, prompt, status, agent_id,
 			gate_command, gate_status, gate_exit_code, gate_output,
-			output, exit_code, attempt_count, lease_expires_at,
+			output, exit_code, phase_number, attempt_count, lease_expires_at,
 			started_at, completed_at, created_at
 		FROM jobs WHERE pipeline_id = ? AND name = ? LIMIT 1`, pipelineID, name,
 	).Scan(
 		&j.ID, &j.PipelineID, &j.Name, &j.Prompt, &j.Status, &j.AgentID,
 		&j.GateCommand, &j.GateStatus, &j.GateExitCode, &j.GateOutput,
-		&j.Output, &j.ExitCode, &j.AttemptCount, &j.LeaseExpiresAt,
+		&j.Output, &j.ExitCode, &j.PhaseNumber, &j.AttemptCount, &j.LeaseExpiresAt,
 		&j.StartedAt, &j.CompletedAt, &j.CreatedAt,
 	)
 	if err == sql.ErrNoRows {

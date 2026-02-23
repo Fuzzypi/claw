@@ -68,7 +68,7 @@ func (s *Store) ListReadyJobs(pipelineID int64) ([]*Job, error) {
 	rows, err := s.db.Query(
 		`SELECT j.id, j.pipeline_id, j.name, j.prompt, j.status, j.agent_id,
 			j.gate_command, j.gate_status, j.gate_exit_code, j.gate_output,
-			j.output, j.exit_code, j.attempt_count, j.lease_expires_at,
+			j.output, j.exit_code, j.phase_number, j.attempt_count, j.lease_expires_at,
 			j.started_at, j.completed_at, j.created_at
 		FROM jobs j
 		WHERE j.pipeline_id = ?
@@ -92,7 +92,7 @@ func (s *Store) ListReadyJobs(pipelineID int64) ([]*Job, error) {
 		if err := rows.Scan(
 			&j.ID, &j.PipelineID, &j.Name, &j.Prompt, &j.Status, &j.AgentID,
 			&j.GateCommand, &j.GateStatus, &j.GateExitCode, &j.GateOutput,
-			&j.Output, &j.ExitCode, &j.AttemptCount, &j.LeaseExpiresAt,
+			&j.Output, &j.ExitCode, &j.PhaseNumber, &j.AttemptCount, &j.LeaseExpiresAt,
 			&j.StartedAt, &j.CompletedAt, &j.CreatedAt,
 		); err != nil {
 			return nil, err
