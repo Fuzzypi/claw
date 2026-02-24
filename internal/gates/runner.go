@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -32,6 +33,12 @@ func RunGate(gateCommand string, workDir string, timeout time.Duration) (*GateRe
 	// Use sh -c for commands that need PATH resolution
 	cmd := exec.CommandContext(ctx, "sh", "-c", gateCommand)
 	cmd.Dir = workDir
+	// Put process in its own group so timeout kills the whole tree
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = 3 * time.Second
 
 	var combined bytes.Buffer
 	cmd.Stdout = &combined
